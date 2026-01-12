@@ -2,3 +2,6 @@ pyspark
 python-dotenv
 mlflow
 kaggle
+psutil
+matplotlib
+seaborn

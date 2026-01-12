@@ -9,7 +9,10 @@ class EnvironmentClass(object):
     """
 
     def __init__(self):
-        self.__base_path = os.getcwd()
+        base_path = os.getcwd()
+        if 'notebooks' in base_path:
+            base_path = '/'.join(base_path.split('/')[:-1])
+        self.__base_path = base_path
         self.__mode = os.getenv("MODE", "development")
         self._load_dotenv()
 
@@ -49,20 +52,12 @@ class EnvironmentClass(object):
         Define a raiz do armazenamento. 
         Permite override via env var, útil para mudar local de testes vs produção.
         """
-        default_root = "/FileStore/projects/churn_prediction"
+        default_root = "."
         return self._get_var("BASE_PATH_OVERRIDE", default_root)
 
     @property
-    def raw_path(self) -> str:
-        return f"{self.root_path}/bronze"
-
-    @property
-    def processed_path(self) -> str:
-        return f"{self.root_path}/silver"
-
-    @property
     def feature_store_path(self) -> str:
-        return f"{self.root_path}/gold"
+        return self._get_var("FEATURES_CATALOG")
 
     # --- 3. Constantes de Negócio (Domain Configs) ---
     @property
@@ -76,6 +71,19 @@ class EnvironmentClass(object):
     @property
     def kaggle_dataset_name(self) -> str:
         return "olistbr/brazilian-ecommerce"
+    
+    @property
+    def KAGGLE_CONFIG_DIR(self) -> str:
+     return self._get_var("KAGGLE_CONFIG_DIR")
+
+    @property
+    def DATABRICKS_CATALOG(self) -> str:
+     return self._get_var("DATABRICKS_CATALOG")
+
+    @property
+    def MLFLOW_DFS_TMP(self) -> str:
+     return self._get_var("MLFLOW_DFS_TMP")
+
 
 # Singleton Instance
-conf = EnvironmentClass()
+Environment = EnvironmentClass()

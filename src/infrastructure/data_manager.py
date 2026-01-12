@@ -9,11 +9,14 @@ class DataManager:
         self.spark = spark
 
     def read_csv(self, path: str) -> DataFrame:
-        # Nota: path deve vir formatado com prefixo correto (ex: dbfs:)
-        return self.spark.read.format("csv")\
-            .option("header", "true")\
-            .option("inferSchema", "true")\
-            .load(path)
+        return self.spark.read.csv(
+            path,
+            header=True,
+            inferSchema=True,
+            multiLine=True, # Essencial para o dataset de reviews
+            escape='"',
+            quote='"'
+        )
 
     def read_delta(self, path: str) -> DataFrame:
         return self.spark.read.format("delta").load(path)
