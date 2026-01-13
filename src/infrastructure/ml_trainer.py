@@ -10,7 +10,8 @@ from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
 from src.utility.environment import Environment
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Any, Dict
+from hyperopt import fmin, tpe, Trials, STATUS_OK, SparkTrials
 
 class ITrainer(ABC):
     def __init__(self, experiment_path: str):
@@ -34,6 +35,25 @@ class PySparkTrainer(ITrainer):
 
     def __init__(self, experiment_path: str):
         super().__init__(experiment_path)
+
+    def _fix_hyperopt_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        O Hyperopt retorna inteiros como floats (ex: 5.0). 
+        O Spark quebra se receber float onde espera int.
+        Esta função corrige isso baseada em nomes comuns de parâmetros.
+        """
+        int_params = [
+            'maxDepth', 'maxIter', 'numTrees', 'k', 'maxBins', 
+            'numFolds', 'aggregationDepth'
+        ]
+        
+        cleaned = {}
+        for k, v in params.items():
+            if k in int_params:
+                cleaned[k] = int(v)
+            else:
+                cleaned[k] = v
+        return cleaned
 
     def train(self, df: DataFrame, estimator: Estimator, run_name: str = None, feature_cols: List[str] = None):
         """
@@ -158,3 +178,121 @@ class PySparkTrainer(ITrainer):
             
             print(f"✅ Run finalizada com sucesso.")
             return run.info.run_id
+        
+    def tune(self, 
+            df: DataFrame, 
+            estimator_cls: Any, 
+            search_space: Dict, 
+            feature_cols: List[str] = None, 
+            max_evals: int = 10, 
+            metric: str = "areaUnderROC",
+            run_name: str = None):
+        """
+        Otimização Genérica usando Hyperopt.
+        
+        :param df: DataFrame completo.
+        :param estimator_cls: A CLASSE do algoritmo (ex: GBTClassifier), NÃO a instância.
+        :param search_space: Espaço de busca do Hyperopt.
+        """
+        
+        class_name = estimator_cls.__name__
+        if not run_name:
+            run_name = f"Hyperopt_{class_name}"
+
+        print(f"🚀 Iniciando Otimização para: {class_name}")
+        
+        # 1. Preparação de Dados (Feita UMA vez para performance)
+        # Diferente do treino único, aqui cacheamos os vetores para não reprocessar 50x
+        if feature_cols is None:
+            # Fallback ou lógica para pegar colunas numéricas
+            feature_cols = ["recency", "frequency", "monetary"] # Exemplo
+            
+        assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
+        
+        # Transformamos antes do loop para ganhar velocidade
+        df_vec = assembler.transform(df)
+        
+        # Split Treino/Validação (Fixo para comparar maçãs com maçãs)
+        train_df, val_df = df_vec.randomSplit([0.8, 0.2], seed=42)
+                
+        # Avaliador (Focado em AUC)
+        evaluator = BinaryClassificationEvaluator(
+            labelCol="churn", rawPredictionCol="rawPrediction", metricName=metric
+        )
+
+        # --- FUNÇÃO OBJETIVO ---
+        def objective_function(params):
+            # Corrige tipos (float -> int)
+            params = self._fix_hyperopt_params(params)
+            
+            # Cria Run Aninhada (Child Run)
+            with mlflow.start_run(nested=True):
+                # 1. Instanciar o modelo com os parâmetros da vez
+                # Aqui está a mágica: passamos **params para o construtor da classe
+                model_instance = estimator_cls(labelCol="churn", featuresCol="features", **params)
+                
+                # Log Params
+                mlflow.log_params(params)
+                mlflow.set_tag("stage", "tuning_trial")
+                
+                # 2. Treino e Validação
+                start_time = time.time()
+                try:
+                    model = model_instance.fit(train_df)
+                    predictions = model.transform(val_df)
+                    loss = evaluator.evaluate(predictions)
+                except Exception as e:
+                    print(f"❌ Erro com params {params}: {str(e)}")
+                    return {'loss': 999, 'status': STATUS_OK} # Penalidade alta em caso de erro
+                
+                duration = time.time() - start_time
+                
+                # Log Métricas Básicas da Trial
+                mlflow.log_metric("auc_val", loss)
+                mlflow.log_metric("trial_duration", duration)
+                
+                # O Hyperopt quer MINIMIZAR, então retornamos -AUC
+                return {'loss': -loss, 'status': STATUS_OK, 'params': params}
+
+        # --- EXECUÇÃO DO HYPEROPT ---
+        trials = Trials()
+        
+        # Configura Experimento Pai
+        with mlflow.start_run(run_name=run_name):
+            mlflow.set_tag("type", "hyperparameter_tuning")
+            mlflow.set_tag("algorithm", class_name)
+            
+            best_result = fmin(
+                fn=objective_function,
+                space=search_space,
+                algo=tpe.suggest,
+                max_evals=max_evals,
+                trials=trials
+            )
+            
+            # Recupera os melhores parâmetros reais (corrigidos)
+            # O fmin retorna indices para alguns tipos, então é melhor pegar do objeto trials
+            best_trial = sorted(trials.results, key=lambda x: x['loss'])[0]
+            best_params = best_trial['params']
+
+            
+            mlflow.log_params({f"best_{k}": v for k, v in best_params.items()})
+            mlflow.log_metric("best_auc_val", -best_trial['loss'])
+            
+            # Criação do modelo
+            estimator = estimator_cls(labelCol="churn", featuresCol="features", **best_params)
+            pipeline = Pipeline(stages=[assembler, estimator])
+            model = pipeline.fit(df)
+            # Log do Modelo
+            input_sample = df.select(feature_cols).limit(5).toPandas() 
+            prediction_sample = model.transform(df.limit(5)).toPandas()
+            signature = infer_signature(input_sample, prediction_sample)
+
+            mlflow.spark.log_model(
+                spark_model=model,
+                artifact_path="model", 
+                signature=signature,   # <--- OBRIGATÓRIO PARA UNITY CATALOG
+                input_example=input_sample # Opcional, mas boa prática
+            )
+            
+            return best_params
